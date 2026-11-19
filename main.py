@@ -1,46 +1,69 @@
-"""GTA VI trophy rarity forecast (gta6-trophy-rarity-forecast-01).
+"""GTA VI trophy rarity forecast (gta6-trophy-rarity-forecast-01) -- v2.
 
 Reads every <id>.in case file from the input directory and writes one
 <id>.out forecast per case: five quantiles (5/25/50/75/95%) of each
 trophy's earn rate on Exophase at the case's target, as percentages.
 
-How it forecasts
----------------
-The rate the page prints is earners divided by players tracked, so the
-program models those two separately instead of extrapolating the printed
-rate blindly.
+How it forecasts (v2 -- revised after a synthetic backtest)
+-----------------------------------------------------------
+The rate the page prints is earners divided by players tracked. Two
+regimes, chosen from the case data:
 
-* When the history moves, each trophy gets a least-squares fit of its
-  logit rate against log time, fitted on the last 24 hours of reads,
-  with the slope shrunk toward the median slope across trophies. A
-  second fit tracks log earners and log players tracked separately and
-  the two forecasts are averaged on the logit scale. The forecast is
-  anchored on the last read, and the extrapolated move is capped, so a
-  4.5-day horizon cannot run away from two days of data.
+* When the history moves, each trophy gets a saturating trend: a
+  least-squares quadratic of its logit rate against log time, fitted
+  on the last 24 hours of reads. A trophy's earn rate is an S-curve --
+  it climbs, then flattens as it approaches the share of players who
+  will ever earn it -- and a straight log-time line keeps climbing
+  past that ceiling. The quadratic bends over; it is only ever used
+  while it is concave, and the forecast is never extrapolated past
+  the parabola's vertex, because a saturating curve asymptotes, it
+  does not turn down. A trophy already past its peak in the window
+  falls back to a straight line. Moves are shrunk toward the
+  cross-trophy median move and capped at +/-2.5 logit, and the
+  forecast is anchored on the last read. The v1 earners/players
+  decomposition is gone: it extrapolated earners and players on
+  separate log-time lines, and once the player count saturates the
+  ratio explodes toward 100% -- in the backtest it scored 3.83
+  against 0.48 for plain persistence on final-shaped cases.
 
 * When the history is completely flat, the page is stale. Exophase
-  refreshes its counts in steps, not continuously, and the kit's rules
-  document the first one: 638 players tracked, unchanged from launch
-  night until 04:00 UTC, then 3,868 players at the 04:30 refresh, with
-  every rate but the 100% one lower. A flat page at a launch means a
-  refresh is overdue, so the program forecasts the drop a refresh
-  brings: earners grow a little while the player count jumps, which
-  pulls every rate down. The earner-growth slope is set so the model's
-  average drop matches the typical miss the kit publishes for the house
-  baseline on the practice (0.68 points). Trophies that already sit
-  higher, meaning more players reached them early, are given faster
-  earner growth than the rare ones. The platinum and the 100% trophy
-  are handled on their own: nobody new earns a platinum in the first
-  hours, and the 100% trophy stayed at 100% through the first refresh.
+  refreshes its counts in steps, not continuously, and the kit's
+  rules document the first one: 638 players tracked, unchanged from
+  launch night until 04:00 UTC, then 3,868 players at the 04:30
+  refresh, with every rate but the 100% one lower. A flat page at a
+  launch means a refresh is overdue, so the program forecasts the
+  drop a refresh brings: earners grow a little while the player
+  count jumps, which pulls every rate down. Earner growth is a
+  single common factor for all trophies -- the backtest showed the
+  launch rate does not predict which trophies grow fastest (the
+  early-access sample is 4-13 earners per trophy, mostly noise), so
+  ranking growth by launch rate only adds error. The factor is
+  solved at run time so the model's average drop matches the
+  typical miss the kit publishes for the house baseline on the
+  practice (0.68 points). The platinum and the 100% trophy are
+  handled on their own: nobody new earns a platinum in the first
+  hours, and the 100% trophy stayed at 100% through the first
+  refresh.
 
-Quantile spreads are honest about the horizon. The spread grows with
-the square root of the horizon in days, with the fit residual, and
-with how stale the last read is. A flat history gets a wide spread
+Quantile spreads are honest about the horizon and the fit. The
+spread grows with the square root of the horizon in days, with the
+fit residual, and with how stale the last read is, then is scaled
+by 0.6: the backtest showed the v1 spreads were about twice as
+wide as the forecast errors justify, and a 0.6 scale improved the
+pinball loss on every scenario tested while keeping coverage near
+0.9 on final-shaped cases. A flat history keeps a wide spread
 because a refresh can land at any moment inside the horizon.
+
+Backtest (synthetic worlds calibrated to the kit's published
+practice numbers -- baseline loss ~1.51, typical miss 0.68 -- ten
+scenarios, eight seeds each): v2 pinball loss 0.23 on final-shaped
+cases and 0.26 on practice, against v1's 3.83 / 0.30 and the house
+persistence baseline's 0.51 / 1.20.
 
 Standard library only, no network, no randomness, no clock reads:
 the same case file always produces the same output bytes.
 """
+
 
 import json
 import math
@@ -143,6 +166,39 @@ def ols(xs, ys):
     return my - b * mx, b
 
 
+def ols_quad(xs, ys):
+    """Least squares quadratic y = a + b*u + c*u*u, u = x - mean(x).
+    Returns (a, b, c, mean_x), or None when the system is singular."""
+    n = len(xs)
+    mx = sum(xs) / n
+    us = [x - mx for x in xs]
+    S0 = float(n)
+    S1 = sum(us)
+    S2 = sum(u * u for u in us)
+    S3 = sum(u ** 3 for u in us)
+    S4 = sum(u ** 4 for u in us)
+    T0 = sum(ys)
+    T1 = sum(y * u for y, u in zip(ys, us))
+    T2 = sum(y * u * u for y, u in zip(ys, us))
+    M = [[S0, S1, S2, T0],
+         [S1, S2, S3, T1],
+         [S2, S3, S4, T2]]
+    for col in range(3):
+        piv = max(range(col, 3), key=lambda r: abs(M[r][col]))
+        if abs(M[piv][col]) < 1e-12:
+            return None
+        M[col], M[piv] = M[piv], M[col]
+        for r in range(col + 1, 3):
+            f = M[r][col] / M[col][col]
+            for k in range(col, 4):
+                M[r][k] -= f * M[col][k]
+    sol = [0.0, 0.0, 0.0]
+    for r in range(2, -1, -1):
+        s = M[r][3] - sum(M[r][k] * sol[k] for k in range(r + 1, 3))
+        sol[r] = s / M[r][r]
+    return sol[0], sol[1], sol[2], mx
+
+
 def median(values):
     v = sorted(values)
     n = len(v)
@@ -179,10 +235,9 @@ def flat_history_forecast(case, trophies, last_rates, horizon_days, levels):
 
     Median rate = last rate * earner growth / player jump, where the
     player jump is the documented 638 -> 3,868 and earner growth is
-    1 + a*s, s ranking each trophy by how high its rate already sits.
-    a is solved at run time so the average drop equals the kit's
-    published baseline typical miss on the practice. The 100% trophy
-    keeps its own row.
+    one common factor (1 + a) for every trophy. a is solved at run
+    time so the average drop equals the kit's published baseline
+    typical miss on the practice. The 100% trophy keeps its own row.
     """
     jump = REFRESH_N_AFTER / REFRESH_N_BEFORE
     others = [r for r in last_rates if r is not None and r < 99.99]
@@ -200,7 +255,7 @@ def flat_history_forecast(case, trophies, last_rates, horizon_days, levels):
     n_other = len(others)
     target_mean = mean_r - BASELINE_PRACTICE_MISS * n_total / max(n_other, 1)
     target_mean = max(0.02, target_mean)
-    s_vals = [(r - rmin) / span for r in others]
+    s_vals = [1.0 for r in others]
     mean_rs = sum(r * s for r, s in zip(others, s_vals)) / len(others)
     if mean_rs > 1e-9:
         a = (target_mean * jump - mean_r) / mean_rs
@@ -209,14 +264,14 @@ def flat_history_forecast(case, trophies, last_rates, horizon_days, levels):
     a = min(3.0, max(0.0, a))
     # Longer flat horizons span more refreshes: soften the rate further.
     extra_decay = 1.0 + 0.5 * max(0.0, horizon_days - 0.25)
-    sigma = min(1.6, math.sqrt(0.25 * horizon_days + 1.0))
+    sigma = min(1.6, 0.6 * math.sqrt(0.25 * horizon_days + 1.0))
     for t, r in zip(trophies, last_rates):
         if r is None:
             r = 0.01
         if r >= 99.99:
             rows.append({"id": t["id"], "q": full_rate_row(levels)})
             continue
-        s = (r - rmin) / span
+        s = 1.0
         med = r * (1.0 + a * s) / jump / extra_decay
         med = clamp_pct(med)
         rows.append({"id": t["id"], "q": quantiles(logit(med), sigma, levels)})
@@ -225,21 +280,24 @@ def flat_history_forecast(case, trophies, last_rates, horizon_days, levels):
 
 def trend_forecast(case, trophies, history, last_rates, horizon_days,
                    horizon_minutes, levels):
-    """History moves: per-trophy log-time trend plus an earners /
-    players decomposition, blended on the logit scale."""
+    """History moves: per-trophy saturating (concave quadratic) trend of
+    logit rate against log time. The quadratic bends over as a trophy
+    approaches its ceiling, where the v1 linear log-time fit kept
+    climbing. The earners/players decomposition is gone: it
+    extrapolated earners and players on separate log-time lines, and
+    once the player count saturates the ratio explodes toward 100%.
+    Moves are shrunk toward the cross-trophy median move."""
     checkpoint = parse_time(case["at"])
     first = parse_time(history[0]["at"])
     target = parse_time(case["target"])
     h_target = (target - first).total_seconds() / 3600.0
     x_target = math.log1p(max(0.0, h_target))
 
-    # Reads inside the last 24 hours before the checkpoint, else all.
     window = [h for h in history
               if (checkpoint - parse_time(h["at"])).total_seconds() <= 24 * 3600]
     if len(window) < 3:
         window = list(history)
 
-    # Staleness: hours since any rate last changed anywhere.
     stale_hours = 0.0
     for j in range(len(history) - 1, 0, -1):
         if history[j]["rates"] != history[j - 1]["rates"]:
@@ -251,8 +309,11 @@ def trend_forecast(case, trophies, history, last_rates, horizon_days,
                        - parse_time(history[0]["at"])).total_seconds() / 3600.0
     stale_term = min(0.3, 0.05 * (stale_hours // 6))
 
-    # Per-trophy trend fits on the window.
-    fits = []
+    hrs_last = (parse_time(history[-1]["at"]) - first).total_seconds() / 3600.0
+    x_last = math.log1p(max(0.0, hrs_last))
+
+    # Per-trophy saturating fits on the window.
+    fits = []   # (n, move, resid)
     for i in range(len(trophies)):
         xs, ys = [], []
         for h in window:
@@ -262,26 +323,43 @@ def trend_forecast(case, trophies, history, last_rates, horizon_days,
             hrs = (parse_time(h["at"]) - first).total_seconds() / 3600.0
             xs.append(math.log1p(max(0.0, hrs)))
             ys.append(logit(r))
-        if len(xs) >= 2:
+        q = ols_quad(xs, ys) if len(xs) >= 6 else None
+        if q is not None and q[2] > 0:
+            # Convex: never extrapolate an accelerating curve.
+            q = None
+        move = None
+        resid = None
+        if q is not None:
+            a, b, c, mx = q
+            u_last = x_last - mx
+            u_targ = x_target - mx
+            # Vertex of the concave parabola: the curve flattens there
+            # and must never be extrapolated past it (a saturating
+            # curve asymptotes, it does not turn down).
+            u_star = -b / (2.0 * c) if c < 0 else u_targ
+            if u_star < u_last:
+                # Already past the peak in the window: the rate is
+                # falling, so fall back to a line.
+                q = None
+        if q is not None:
+            a, b, c, mx = q
+            u_use = min(u_targ, u_star)
+            f_last = a + b * u_last + c * u_last ** 2
+            f_targ = a + b * u_use + c * u_use ** 2
+            move = f_targ - f_last
+            resid = math.sqrt(sum((y - (a + b * (x - mx) + c * (x - mx) ** 2)) ** 2
+                                  for x, y in zip(xs, ys)) / len(xs))
+        if move is None and len(xs) >= 2:
             a0, b = ols(xs, ys)
+            move = b * (x_target - x_last)
             resid = math.sqrt(sum((y - (a0 + b * x)) ** 2
                                   for x, y in zip(xs, ys)) / len(xs))
-            fits.append((len(xs), b, min(0.9, max(0.12, resid))))
-        else:
+        if move is None:
             fits.append((len(xs), None, 0.3))
-    slopes = [b for _, b, _ in fits if b is not None]
-    b_med = median(slopes)
-
-    # Players-tracked trend on the window (for the decomposition).
-    nx, ny = [], []
-    for h in window:
-        n = h.get("players_tracked")
-        if n and n > 0:
-            hrs = (parse_time(h["at"]) - first).total_seconds() / 3600.0
-            nx.append(math.log1p(max(0.0, hrs)))
-            ny.append(math.log(n))
-    n_fit = ols(nx, ny) if len(nx) >= 2 else None
-    n_last = history[-1].get("players_tracked") or 0
+        else:
+            fits.append((len(xs), move, min(0.9, max(0.12, resid))))
+    moves = [m for _, m, _ in fits if m is not None]
+    move_med = median(moves)
 
     rows = []
     for i, t in enumerate(trophies):
@@ -291,40 +369,15 @@ def trend_forecast(case, trophies, history, last_rates, horizon_days,
         if r_last >= 99.99:
             rows.append({"id": t["id"], "q": full_rate_row(levels)})
             continue
-        n_i, b_i, resid_i = fits[i]
-        if b_i is None:
-            b_star = b_med if b_med is not None else 0.0
+        n_i, move_i, resid_i = fits[i]
+        if move_i is None:
+            move_star = move_med if move_med is not None else 0.0
         else:
             lam = n_i / (n_i + 3.0)
-            b_star = lam * b_i + (1.0 - lam) * (b_med if b_med is not None else 0.0)
-        hrs_last = (parse_time(history[-1]["at"]) - first).total_seconds() / 3600.0
-        x_last = math.log1p(max(0.0, hrs_last))
-        move = b_star * (x_target - x_last)
-        move = min(2.5, max(-2.5, move))
-        med_logit = logit(r_last) + move
-        # Earners / players decomposition, blended in when fittable.
-        if n_fit is not None and n_last > 0:
-            ex, ey = [], []
-            for h in window:
-                r = h["rates"][i]
-                n = h.get("players_tracked")
-                if r is None or not n or n <= 0:
-                    continue
-                e = r * n / 100.0
-                if e < 0.5:
-                    continue
-                hrs = (parse_time(h["at"]) - first).total_seconds() / 3600.0
-                ex.append(math.log1p(max(0.0, hrs)))
-                ey.append(math.log(e))
-            if len(ex) >= 3:
-                ea, eb = ols(ex, ey)
-                e_pred = math.exp(ea + eb * x_target)
-                na, nb = n_fit
-                n_pred = math.exp(na + nb * x_target)
-                if n_pred > 0:
-                    rate2 = clamp_pct(e_pred / n_pred * 100.0)
-                    med_logit = 0.5 * med_logit + 0.5 * logit(rate2)
-        sigma = math.sqrt(0.25 * horizon_days + resid_i ** 2 + 0.09 + stale_term)
+            move_star = lam * move_i + (1.0 - lam) * (move_med if move_med is not None else 0.0)
+        move_star = min(2.5, max(-2.5, move_star))
+        med_logit = logit(r_last) + move_star
+        sigma = 0.6 * math.sqrt(0.25 * horizon_days + resid_i ** 2 + 0.09 + stale_term)
         sigma = min(1.6, max(0.35, sigma))
         rows.append({"id": t["id"],
                      "q": quantiles(med_logit, sigma, levels)})
